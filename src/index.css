@@ -1,0 +1,21 @@
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #f7f7f5;
+  color: #1a1a1a;
+  overscroll-behavior-y: contain;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button:focus-visible, input:focus-visible {
+  outline: 2px solid #166636;
+  outline-offset: 2px;
+}
