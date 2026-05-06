@@ -362,15 +362,42 @@ function DraggableCard({ drug, onTap, state }) {
   };
   const handleDragEnd = () => setIsDragging(false);
 
-  // Touch fallback (mobile)
+  // Touch fallback (mobile) — with bulletproof cleanup
+  const cleanupGhost = () => {
+    document.body.style.touchAction = "";
+    if (touchData.current.ghost) {
+      try { touchData.current.ghost.remove(); } catch (e) { /* may already be gone */ }
+      touchData.current.ghost = null;
+    }
+    setIsDragging(false);
+  };
+
+  // On unmount, remove any orphaned ghost (and any stragglers from bad touchcancel events)
+  useEffect(() => {
+    return () => {
+      cleanupGhost();
+      // Sweep up any stray ghosts left behind from older drags
+      document.querySelectorAll(".ds-touch-ghost").forEach(el => {
+        try { el.remove(); } catch (e) { /* ignore */ }
+      });
+      document.body.style.touchAction = "";
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleTouchStart = (e) => {
     const t = e.touches[0];
     touchData.current.moved = false;
     touchData.current.startX = t.clientX;
     touchData.current.startY = t.clientY;
+    // Defensive: clear any stray ghosts from a failed previous drag
+    document.querySelectorAll(".ds-touch-ghost").forEach(el => {
+      try { el.remove(); } catch (e) { /* ignore */ }
+    });
   };
 
   const handleTouchMove = (e) => {
+    if (!e.touches || e.touches.length === 0) return;
     const t = e.touches[0];
     const dx = Math.abs(t.clientX - touchData.current.startX);
     const dy = Math.abs(t.clientY - touchData.current.startY);
@@ -379,6 +406,7 @@ function DraggableCard({ drug, onTap, state }) {
       // Create ghost
       const rect = cardRef.current.getBoundingClientRect();
       const ghost = cardRef.current.cloneNode(true);
+      ghost.classList.add("ds-touch-ghost");
       ghost.style.position = "fixed";
       ghost.style.pointerEvents = "none";
       ghost.style.opacity = "0.85";
@@ -387,45 +415,53 @@ function DraggableCard({ drug, onTap, state }) {
       ghost.style.top = `${rect.top}px`;
       ghost.style.transform = "scale(1.05)";
       ghost.style.boxShadow = "0 8px 18px rgba(0,0,0,0.18)";
+      ghost.style.width = `${rect.width}px`;
       document.body.appendChild(ghost);
       touchData.current.ghost = ghost;
+      touchData.current.offsetX = touchData.current.startX - rect.left;
+      touchData.current.offsetY = touchData.current.startY - rect.top;
       setIsDragging(true);
       // Prevent scroll while dragging
       document.body.style.touchAction = "none";
     }
     if (touchData.current.ghost) {
       e.preventDefault();
-      const rect = cardRef.current.getBoundingClientRect();
-      const offsetX = touchData.current.startX - rect.left;
-      const offsetY = touchData.current.startY - rect.top;
-      touchData.current.ghost.style.left = `${t.clientX - offsetX}px`;
-      touchData.current.ghost.style.top = `${t.clientY - offsetY}px`;
+      touchData.current.ghost.style.left = `${t.clientX - touchData.current.offsetX}px`;
+      touchData.current.ghost.style.top = `${t.clientY - touchData.current.offsetY}px`;
     }
   };
 
   const handleTouchEnd = (e) => {
-    document.body.style.touchAction = "";
     if (touchData.current.ghost) {
-      touchData.current.ghost.remove();
-      touchData.current.ghost = null;
-      setIsDragging(false);
-      // Find the drop target under the touch point
-      const t = e.changedTouches[0];
-      const target = document.elementFromPoint(t.clientX, t.clientY);
-      const dropZone = target ? target.closest("[data-dropzone]") : null;
+      // Find drop target under the final touch point
+      let dropZone = null;
+      if (e.changedTouches && e.changedTouches.length > 0) {
+        const t = e.changedTouches[0];
+        const target = document.elementFromPoint(t.clientX, t.clientY);
+        dropZone = target ? target.closest("[data-dropzone]") : null;
+      }
+      cleanupGhost();
       if (dropZone) {
-        // Fire a synthetic drop event
         const customEvent = new CustomEvent("touchdrop", {
           detail: { drug: drug.n },
           bubbles: true
         });
         dropZone.dispatchEvent(customEvent);
       }
+    } else {
+      cleanupGhost();
+      if (!touchData.current.moved) {
+        // Pure tap
+        onTap();
+      }
     }
-    if (!touchData.current.moved) {
-      // Pure tap
-      onTap();
-    }
+    touchData.current.moved = false;
+  };
+
+  // Cancellation (interrupted by OS, alert, etc.) — guarantee cleanup
+  const handleTouchCancel = () => {
+    cleanupGhost();
+    touchData.current.moved = false;
   };
 
   let bg = CARD;
@@ -450,6 +486,7 @@ function DraggableCard({ drug, onTap, state }) {
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
+      onTouchCancel={handleTouchCancel}
       onClick={(e) => {
         // Only trigger tap if we didn't drag
         if (!touchData.current.moved) onTap();
@@ -464,7 +501,6 @@ function DraggableCard({ drug, onTap, state }) {
       }}
     >
       <span>{drug.n}</span>
-      <span style={{ ...styles.freqDot, backgroundColor: FREQ_COLOUR[drug.f] }} />
     </div>
   );
 }
@@ -550,29 +586,124 @@ function InfoPanel({ drug, onClose }) {
 // ============ REFERENCE TAB ============
 
 function ReferenceTab() {
-  const sortedDrugs = useMemo(
-    () => [...DRUGS].sort((a, b) => a.s - b.s || a.n.localeCompare(b.n)),
-    []
-  );
+  const [scheduleFilter, setScheduleFilter] = useState(new Set([2, 3, 4, 5]));
+  const [search, setSearch] = useState("");
+  // Sort: { key, dir }. dir: 'asc' | 'desc'
+  const [sort, setSort] = useState({ key: "s", dir: "asc" });
+
+  const toggleSchedule = (n) => {
+    setScheduleFilter(prev => {
+      const next = new Set(prev);
+      if (next.has(n)) {
+        if (next.size > 1) next.delete(n);
+      } else {
+        next.add(n);
+      }
+      return next;
+    });
+  };
+
+  const handleSort = (key) => {
+    setSort(prev => {
+      if (prev.key === key) {
+        return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
+      }
+      return { key, dir: "asc" };
+    });
+  };
+
+  const FREQ_RANK = { high: 0, mid: 1, mep: 2, low: 3 };
+
+  const filteredSorted = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let list = DRUGS.filter(d => scheduleFilter.has(d.s));
+    if (q) {
+      list = list.filter(d => d.n.toLowerCase().includes(q) || d.note.toLowerCase().includes(q));
+    }
+    const cmp = (a, b) => {
+      let av, bv;
+      switch (sort.key) {
+        case "n": av = a.n.toLowerCase(); bv = b.n.toLowerCase(); break;
+        case "s": av = a.s; bv = b.s; break;
+        case "f": av = FREQ_RANK[a.f] ?? 9; bv = FREQ_RANK[b.f] ?? 9; break;
+        case "r": av = a.r ? 1 : 0; bv = b.r ? 1 : 0; break;
+        case "c": av = a.c ? 1 : 0; bv = b.c ? 1 : 0; break;
+        case "wf": av = a.wf ? 1 : 0; bv = b.wf ? 1 : 0; break;
+        case "w": av = a.w ? 1 : 0; bv = b.w ? 1 : 0; break;
+        default: av = a.s; bv = b.s;
+      }
+      if (av < bv) return sort.dir === "asc" ? -1 : 1;
+      if (av > bv) return sort.dir === "asc" ? 1 : -1;
+      // Stable secondary sort by name
+      return a.n.localeCompare(b.n);
+    };
+    return list.slice().sort(cmp);
+  }, [scheduleFilter, search, sort]);
+
+  const SortableTh = ({ k, label }) => {
+    const active = sort.key === k;
+    const arrow = active ? (sort.dir === "asc" ? " ↑" : " ↓") : "";
+    return (
+      <th
+        style={{ ...styles.refTh, cursor: "pointer", userSelect: "none", color: active ? GREEN : MUTED }}
+        onClick={() => handleSort(k)}
+      >
+        {label}{arrow}
+      </th>
+    );
+  };
 
   return (
     <div style={styles.refWrap}>
+      <div style={styles.refControls}>
+        <input
+          type="search"
+          placeholder="Search drug name or note…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={styles.refSearch}
+        />
+        <div style={styles.refFilterRow}>
+          <span style={styles.filterLabel}>Schedule</span>
+          {SCHEDULES.map(s => (
+            <FilterChip
+              key={s.n}
+              active={scheduleFilter.has(s.n)}
+              colour={s.colour}
+              onClick={() => toggleSchedule(s.n)}
+            >
+              {s.label}
+            </FilterChip>
+          ))}
+        </div>
+        <div style={styles.refResultCount}>
+          {filteredSorted.length} of {DRUGS.length} drugs · tap any column header to sort
+        </div>
+      </div>
+
       <div style={styles.refTableScroll}>
         <table style={styles.refTable}>
           <thead>
             <tr>
-              <th style={styles.refTh}>Drug</th>
-              <th style={styles.refTh}>Sched</th>
-              <th style={styles.refTh}>Freq</th>
-              <th style={styles.refTh}>Reg</th>
-              <th style={styles.refTh}>Custody</th>
-              <th style={styles.refTh}>W&F</th>
-              <th style={styles.refTh}>Wit dest</th>
+              <SortableTh k="n" label="Drug" />
+              <SortableTh k="s" label="Sch" />
+              <SortableTh k="f" label="Freq" />
+              <SortableTh k="r" label="Reg" />
+              <SortableTh k="c" label="Custody" />
+              <SortableTh k="wf" label="W&F" />
+              <SortableTh k="w" label="Wit dest" />
               <th style={styles.refTh}>Note</th>
             </tr>
           </thead>
           <tbody>
-            {sortedDrugs.map(d => {
+            {filteredSorted.length === 0 && (
+              <tr>
+                <td colSpan="8" style={{ ...styles.refTd, textAlign: "center", color: MUTED, padding: "20px 8px" }}>
+                  No drugs match the current filter.
+                </td>
+              </tr>
+            )}
+            {filteredSorted.map(d => {
               const sched = SCHEDULE_BY_N[d.s];
               return (
                 <tr key={d.n}>
@@ -1219,19 +1350,52 @@ const styles = {
   refWrap: {
     marginTop: 4
   },
+  refControls: {
+    marginBottom: 10,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8
+  },
+  refSearch: {
+    width: "100%",
+    padding: "8px 10px",
+    fontSize: 13,
+    border: `1px solid ${RULE}`,
+    borderRadius: 8,
+    fontFamily: "inherit",
+    color: INK,
+    backgroundColor: CARD,
+    boxSizing: "border-box"
+  },
+  refFilterRow: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    alignItems: "center"
+  },
+  refResultCount: {
+    fontSize: 11,
+    color: MUTED,
+    fontStyle: "italic"
+  },
   refTableScroll: {
     overflowX: "auto",
+    overflowY: "auto",
+    maxHeight: "65vh",
     border: `1px solid ${RULE}`,
-    borderRadius: 8
+    borderRadius: 8,
+    background: CARD,
+    WebkitOverflowScrolling: "touch"
   },
   refTable: {
     width: "100%",
-    borderCollapse: "collapse",
+    borderCollapse: "separate",
+    borderSpacing: 0,
     fontSize: 11
   },
   refTh: {
     textAlign: "left",
-    padding: "6px 8px",
+    padding: "8px 10px",
     borderBottom: `1.5px solid ${RULE}`,
     color: MUTED,
     fontWeight: 600,
@@ -1239,7 +1403,11 @@ const styles = {
     textTransform: "uppercase",
     fontSize: 9,
     letterSpacing: "0.05em",
-    background: PAPER
+    background: PAPER,
+    position: "sticky",
+    top: 0,
+    zIndex: 2,
+    boxShadow: `0 1px 0 ${RULE}`
   },
   refTd: {
     padding: "6px 8px",
@@ -1250,7 +1418,8 @@ const styles = {
   refNote: {
     fontSize: 10,
     color: MUTED,
-    maxWidth: 200,
+    maxWidth: 220,
+    minWidth: 180,
     lineHeight: 1.4
   },
   // Quiz
