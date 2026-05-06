@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import QUESTIONS from "./questions.json";
+import SchedulesView from "./SchedulesView.jsx";
 
 // === COLOURS & STYLE ===
 const GREEN = "rgb(22, 102, 54)";
@@ -26,7 +27,8 @@ function userKeys(userKey) {
     MASTERY: `gphc:${userKey}:mastery`,
     HISTORY: `gphc:${userKey}:history`,
     GENERATION: `gphc:${userKey}:gen`,
-    PREFS: `gphc:${userKey}:prefs`
+    PREFS: `gphc:${userKey}:prefs`,
+    SCHEDULES: `gphc:${userKey}:schedules`
   };
 }
 
@@ -107,6 +109,7 @@ export default function App() {
   const [mastery, setMastery] = useState({});
   const [history, setHistory] = useState([]);
   const [seenInPass, setSeenInPass] = useState([]);
+  const [scheduleStats, setScheduleStats] = useState({ roundsCompleted: 0 });
   const [loading, setLoading] = useState(true);
 
   // Session state
@@ -142,15 +145,26 @@ export default function App() {
     const h = await storageGet(k.HISTORY, []);
     const g = await storageGet(k.GENERATION, { currentBatch: 1, seenIds: [] });
     const p = await storageGet(k.PREFS, { timerOn: false, topic: "All" });
+    const ss = await storageGet(k.SCHEDULES, { roundsCompleted: 0 });
     setMastery(m);
     setHistory(h);
     setSeenInPass(g.seenIds || []);
     setTimerOn(p.timerOn || false);
     setTopicFilter(p.topic || "All");
+    setScheduleStats(ss);
     setActiveUserKey(userKey);
     setActiveUserName(displayName);
     setLoading(false);
   }
+
+  // Persist schedule stats whenever they change
+  const handleScheduleStatsChange = useCallback((newStats) => {
+    if (!activeUserKey) return;
+    const resolved = typeof newStats === "function" ? newStats(scheduleStats) : newStats;
+    setScheduleStats(resolved);
+    const k = userKeys(activeUserKey);
+    storageSet(k.SCHEDULES, resolved);
+  }, [activeUserKey, scheduleStats]);
 
   // Create a new user profile
   async function createUser(displayName) {
@@ -191,6 +205,7 @@ export default function App() {
     await storageDelete(k.HISTORY);
     await storageDelete(k.GENERATION);
     await storageDelete(k.PREFS);
+    await storageDelete(k.SCHEDULES);
     const updated = allUsers.filter(x => x.key !== userKey);
     await storageSet(ROOT_KEYS.USERS, updated);
     setAllUsers(updated);
@@ -202,6 +217,7 @@ export default function App() {
       setMastery({});
       setHistory([]);
       setSeenInPass([]);
+      setScheduleStats({ roundsCompleted: 0 });
       setShowProfilePicker(false);
     }
   }
@@ -417,6 +433,8 @@ export default function App() {
             totalAvailable={totalAvailable}
             allSeen={allSeen}
             triggerComplete={() => setShowCompleteBank(true)}
+            openSchedules={() => setView("schedules")}
+            scheduleStats={scheduleStats}
           />
         )}
 
@@ -456,6 +474,13 @@ export default function App() {
             seenInPass={seenInPass}
             onReset={resetBank}
             onOpenProfile={() => setShowProfilePicker(true)}
+          />
+        )}
+
+        {view === "schedules" && (
+          <SchedulesView
+            stats={scheduleStats}
+            onStatsChange={handleScheduleStatsChange}
           />
         )}
       </main>
@@ -502,9 +527,12 @@ function Header({ view, setView, userName, onOpenProfile }) {
   );
 }
 
-function HomeView({ userName, allTopics, topicFilter, setTopicFilter, timerOn, setTimerOn, startSession, totalSeen, totalAvailable, allSeen, triggerComplete }) {
+function HomeView({ userName, allTopics, topicFilter, setTopicFilter, timerOn, setTimerOn, startSession, totalSeen, totalAvailable, allSeen, triggerComplete, openSchedules, scheduleStats }) {
   const progressPct = Math.round((totalSeen / totalAvailable) * 100);
   const firstName = (userName || "").split(/\s+/)[0];
+  const bestTime = scheduleStats?.scheduleBest?.time;
+  const bestQuiz = scheduleStats?.quizBest?.pct;
+  const rounds = scheduleStats?.roundsCompleted || 0;
   return (
     <div style={styles.homeContainer}>
       <section style={styles.heroCard}>
@@ -576,6 +604,29 @@ function HomeView({ userName, allTopics, topicFilter, setTopicFilter, timerOn, s
           <div style={styles.modeDesc}>Keep going until you stop.</div>
           <div style={styles.modeArrow}>→</div>
         </button>
+      </section>
+
+      <section style={styles.schedulesCard} onClick={openSchedules}>
+        <div style={styles.schedulesCardKicker}>Schedule drilling</div>
+        <div style={styles.schedulesCardTitle}>Drug Schedules</div>
+        <div style={styles.schedulesCardDesc}>
+          54 drugs sorted by exam frequency. Drag-and-drop game, reference table, quick quiz.
+        </div>
+        <div style={styles.schedulesCardStats}>
+          <div style={styles.schedulesCardStat}>
+            <div style={styles.schedulesCardStatVal}>{rounds}</div>
+            <div style={styles.schedulesCardStatLbl}>rounds</div>
+          </div>
+          <div style={styles.schedulesCardStat}>
+            <div style={styles.schedulesCardStatVal}>{bestTime ? `${bestTime}s` : "—"}</div>
+            <div style={styles.schedulesCardStatLbl}>best time</div>
+          </div>
+          <div style={styles.schedulesCardStat}>
+            <div style={styles.schedulesCardStatVal}>{bestQuiz != null ? `${bestQuiz}%` : "—"}</div>
+            <div style={styles.schedulesCardStatLbl}>best quiz</div>
+          </div>
+        </div>
+        <div style={styles.modeArrow}>→</div>
       </section>
 
       {allSeen && (
@@ -1427,6 +1478,56 @@ const styles = {
     fontSize: 14,
     color: "#7a5a00",
     cursor: "pointer"
+  },
+  schedulesCard: {
+    position: "relative",
+    background: GREEN_SOFT,
+    border: `1.5px solid ${GREEN_BORDER}`,
+    borderRadius: 12,
+    padding: "16px 18px 14px",
+    cursor: "pointer",
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    fontFamily: "inherit"
+  },
+  schedulesCardKicker: {
+    fontSize: 10,
+    color: GREEN,
+    textTransform: "uppercase",
+    letterSpacing: "0.08em",
+    fontWeight: 700
+  },
+  schedulesCardTitle: {
+    fontSize: 18,
+    fontWeight: 700,
+    color: INK
+  },
+  schedulesCardDesc: {
+    fontSize: 13,
+    color: MUTED,
+    lineHeight: 1.45,
+    marginBottom: 6
+  },
+  schedulesCardStats: {
+    display: "flex",
+    gap: 14,
+    marginTop: 4
+  },
+  schedulesCardStat: {
+    flex: "0 0 auto"
+  },
+  schedulesCardStatVal: {
+    fontSize: 16,
+    fontWeight: 700,
+    color: INK
+  },
+  schedulesCardStatLbl: {
+    fontSize: 10,
+    color: MUTED,
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+    marginTop: 2
   },
   // SESSION
   sessionContainer: {
